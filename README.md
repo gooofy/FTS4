@@ -1,7 +1,7 @@
 # FTS4
 Amiga FTS4: File Transfer Serial, Version 4
 
-This is a very simply pair of programs for file transfer between an Amiga and a Linux computer over a serial null modem cable.
+This is a very simple pair of programs for file transfer between an Amiga and a Linux computer over a serial null modem cable.
 
 Serial port setting:
 * 19200 bps
@@ -35,6 +35,12 @@ on the Amiga side:
 ```bash
 fts4
 ```
+
+## Source Code
+
+Source code is included, to compile the Amiga program you will the Aztec C 5.0a compiler, available here:
+
+http://www.aztecmuseum.ca/compilers.htm#amiga
 
 ## License
 
