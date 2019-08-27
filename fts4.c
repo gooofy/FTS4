@@ -246,7 +246,7 @@ static void read_message(struct ax_header *header, UBYTE *payload, int max_len)
    read_serial(12, (UBYTE *) header);
    crc2 = crc32((UBYTE *) header, 8);
 
-   log (LOG_DEBUG, "MSG: cmd=0x%04x len=%d seq=%d crc=%08x crc2=%08x\n",
+   log (LOG_DEBUG, "MSG : cmd=0x%04x len=%d seq=%d crc=%08x crc2=%08x\n",
         header->msg, header->len, header->seq, header->crc, crc2);
 
    if (header->crc != crc2) 
@@ -473,8 +473,7 @@ static void msg_next_part (UBYTE *buf, WORD len)
    }
    else
    {
-      log(LOG_ERROR, "*** ERROR: MSG_NEXT_PART received while not receiving!\n");
-      closedown();
+      log(LOG_DEBUG, "SYNC\n");
    }
 }
 int main(int argc, char **argv)
