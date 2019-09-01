@@ -1,6 +1,6 @@
 #include "crc.h"
 
-/* #define DEBUG */
+/* #define DEBUG  */
 
 static void _crc32 (unsigned char b, ULONG *reg32)
 {

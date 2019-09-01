@@ -1,13 +1,16 @@
 #include <exec/exec.h>
 #include <functions.h>
 #include <devices/serial.h>
+#include <devices/timer.h>
 #include <libraries/dosextens.h>
 #include <stdio.h>
 #include <stdarg.h>
 
 #include "crc.h"
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
+
+/* #define DEBUG_BYTES */
 
 #define DEFAULT_BAUDRATE  19200
 #define DEFAULT_DEVICE    "serial.device"
@@ -18,6 +21,9 @@ static char *device_name = DEFAULT_DEVICE;
 #define BUFSIZE    1024
 #define READSIZE    512
 #define PATH_MAX    512
+
+#define SERIAL_TIMEOUT_SECS  1
+#define SERIAL_TIMEOUT_MIRCO 0
 
 #define LOG_DEBUG2    0
 #define LOG_DEBUG     1
@@ -43,7 +49,12 @@ static ULONG              wait_mask;
 static struct MsgPort    *mp_serial   = NULL;
 static struct IOExtSer   *io_serial   = NULL;
 static BOOL               serial_open = FALSE;
+
+static struct timerequest io_tr;
+static BOOL               timer_open  = FALSE;
+
 static struct FileHandle *io_file     = NULL;
+
 
 static void log(int level, char *msg, ...)
 {
@@ -61,21 +72,40 @@ static void log(int level, char *msg, ...)
 
 static void closedown(void)
 {
-   log(LOG_DEBUG, "closedown.\n");
+   log(LOG_DEBUG, "closedown procedure starts.\n");
    if (serial_open)
    {
+      log(LOG_DEBUG, "closedown: AbortIO\n");
       AbortIO((struct IORequest*)io_serial);
+      log(LOG_DEBUG, "closedown: WaitIO\n");
       WaitIO((struct IORequest*)io_serial);
+      log(LOG_DEBUG, "closedown: CloseDevice\n");
       CloseDevice((struct IORequest*)io_serial);
    }
    if (io_serial)
    {
+      log(LOG_DEBUG, "closedown: DeleteExtIO\n");
       DeleteExtIO( (struct IORequest *) io_serial);
    }
    if (mp_serial)
+   {
+      log(LOG_DEBUG, "closedown: DeletePort\n");
       DeletePort(mp_serial);
-   if (io_file)
+   }
+   if (io_file) 
+   {
+      log(LOG_DEBUG, "closedown: Close file\n");
       Close((BPTR) io_file);
+   }
+   if (timer_open)
+   {
+      log(LOG_DEBUG, "closedown: AbortIO timer\n");
+      AbortIO((struct IORequest*)&io_tr);
+      log(LOG_DEBUG, "closedown: WaitIO timer\n");
+      WaitIO((struct IORequest*)&io_tr);
+      log(LOG_DEBUG, "closedown: CloseDevice timer\n");
+      CloseDevice((struct IORequest*)&io_tr);
+   }
    log(LOG_INFO, "goodbye.\n");
    exit();
 }
@@ -127,7 +157,6 @@ static void setup_serial(ULONG baud)
    log (LOG_INFO, "setting baudrate to %d\n", baud);
    io_serial->IOSer.io_Command  = SDCMD_SETPARAMS;
    io_serial->io_Baud           = baud ;
-   io_serial->io_RBufLen        = BUFSIZE;
    if (DoIO( (struct IORequest*) io_serial))
    {
       log (LOG_ERROR, "*** ERROR: failed to set serial parameters!\n");
@@ -135,47 +164,97 @@ static void setup_serial(ULONG baud)
    }
 }
 
-static void read_serial(int len, UBYTE *buf)
+static int read_serial(int len, UBYTE *buf)
 {
    ULONG signals;
+   int   todo   = len;
+   int   offset = 0;
+   BOOL  timeout = FALSE;
 
-   log(LOG_DEBUG2, "reading %d bytes from serial port...\n", len);
-   io_serial->IOSer.io_Command = CMD_READ;
-   io_serial->IOSer.io_Length  = len;
-   io_serial->IOSer.io_Data    = (APTR)buf;
-   SendIO( (struct IORequest*) io_serial);
-
-   while ( 1 )
+   while ( !timeout && (todo > 0) )
    {
-      signals = Wait(wait_mask);
+      log(LOG_DEBUG2, "reading %d bytes at off %d from serial port...\n", 
+          todo, offset);
+      io_serial->IOSer.io_Command = CMD_READ;
+      io_serial->IOSer.io_Length  = todo;
+      io_serial->IOSer.io_Data    = (APTR) (buf + offset);
+      SendIO( (struct IORequest*) io_serial);
 
-      /* CTRL-C ? */
-      if (signals & SIGBREAKF_CTRL_C)
-      {
-         log(LOG_INFO, "CTRL-C detected, aborting.\n");
-         closedown(); 
-      }
+      io_tr.tr_node.io_Command              = TR_ADDREQUEST;
+      io_tr.tr_node.io_Message.mn_ReplyPort = mp_serial;
+      io_tr.tr_time.tv_secs                 = SERIAL_TIMEOUT_SECS;
+      io_tr.tr_time.tv_micro                = SERIAL_TIMEOUT_MIRCO;
+      SendIO( (struct IORequest*) &io_tr);
 
-      if (CheckIO((struct IORequest*) io_serial))
+      while ( !timeout )
       {
-         int len_actual, i;
-         WaitIO((struct IORequest*)io_serial);
-         len_actual = io_serial->IOSer.io_Actual;
-         log(LOG_DEBUG2, "%ld bytes received:", 
-                len_actual);
-         for (i=0; (i<len_actual && i<9); i++)
-            log(LOG_DEBUG2, " %02x", buf[i]);
-         log(LOG_DEBUG2, "\n");
-         if (len_actual != len) 
+         signals = Wait(wait_mask);
+
+         /* CTRL-C ? */
+         if (signals & SIGBREAKF_CTRL_C)
          {
-            log (LOG_ERROR, 
-                 "*** ERROR: got %d bytes from serial port, expected %d\n",
-                 len_actual, len);
-            closedown();
+            log(LOG_INFO, "CTRL-C detected, aborting.\n");
+            closedown(); 
          }
-         break;
+
+         if (CheckIO((struct IORequest*) io_serial))
+         {
+            int len_actual, i;
+            WaitIO((struct IORequest*)io_serial);
+            len_actual = io_serial->IOSer.io_Actual;
+#ifdef DEBUG_BYTES
+            log(LOG_DEBUG2, "%ld bytes received:", len_actual);
+            for (i=offset; (i<len_actual && i<9); i++)
+               log(LOG_DEBUG2, " %02x", buf[i]);
+            log(LOG_DEBUG2, "\n");
+#endif
+
+            todo   -= len_actual;
+            offset += len_actual; 
+
+            AbortIO((struct IORequest*)&io_tr);
+            WaitIO((struct IORequest*)&io_tr);
+
+            break;
+         }
+
+         if (CheckIO((struct IORequest*) &io_tr))
+         {
+            log (LOG_DEBUG, "ERR : serial read timeout after %d bytes!\n", offset);
+            WaitIO((struct IORequest*) &io_tr);
+
+            AbortIO((struct IORequest*)io_serial);
+            WaitIO((struct IORequest*)io_serial);
+
+            timeout = TRUE;
+
+            break;
+         }
       }
    }
+
+   return offset;
+}
+
+static void skip_serial_pending(void)
+{
+
+   UBYTE scratch[READSIZE];
+
+   /* read until serial device is "empty" 
+      (used for re-sync purposes)          */
+
+   while (1)
+   {
+      int i, len_actual=0;
+   
+      len_actual = read_serial(READSIZE, scratch);
+
+      if (len_actual <= 0)
+         break;
+   }
+
+   log(LOG_DEBUG, "SYNC: skip_serial_pending done.\n");
 }
 
 static void write_serial(int len, UBYTE *buf)
@@ -222,75 +301,84 @@ static void write_serial(int len, UBYTE *buf)
 
 static void write_ack(void)
 {
+   log (LOG_DEBUG, "ACK\n");
    write_serial(4, (UBYTE*) "PkOk");
 }
 
 static void write_nack(void)
 {
-   write_serial(4, (UBYTE*) "PkEr");
+   log (LOG_DEBUG, "NACK\n");
+   write_serial(4, (UBYTE*) "PkRs");
 }
 
 struct ax_header {
-   WORD msg;
-   WORD len;
+   UBYTE sync;
+   UBYTE msg;
+   WORD  len;
    ULONG seq;
    ULONG crc;
 } ;
 
 static void read_message(struct ax_header *header, UBYTE *payload, int max_len)
 {
-   ULONG crc2;
-
-   /* header */
-
-   read_serial(12, (UBYTE *) header);
-   crc2 = crc32((UBYTE *) header, 8);
-
-   log (LOG_DEBUG, "MSG : cmd=0x%04x len=%d seq=%d crc=%08x crc2=%08x\n",
-        header->msg, header->len, header->seq, header->crc, crc2);
-
-   if (header->crc != crc2) 
+   while (TRUE)
    {
-      log (LOG_ERROR, "ERROR: message header CRC mismatch!\n");
-      write_nack();
-      closedown();
-   }
-   /* FIXME: check sequence! */
+      ULONG crc2;
+      int len_actual;
 
-   /* payload, if any */
+      /* header */
 
-   if (header->len)
-   {
-      ULONG crc1;
-      if (header->len > max_len)
+      len_actual = read_serial(12, (UBYTE *) header);
+
+      if (len_actual == 0)
+         continue;
+
+      crc2 = crc32((UBYTE *) header, 8);
+
+      log (LOG_DEBUG, "MSG : cmd=0x%02x len=%d seq=%d crc=%08x crc2=%08x lena=%d\n",
+           header->msg, header->len, header->seq, header->crc, crc2, len_actual);
+
+      if ( (len_actual != 12) || (header->crc != crc2) )
       {
-         log (LOG_ERROR, "ERROR: buffer overflow (%d > %d)\n", 
-              header->len, max_len);
-         closedown();
-      }
-      read_serial(header->len, payload);
-      read_serial(4, (UBYTE *) &crc1);
-      crc2 = crc32(payload, header->len);
-      if (crc1 != crc2)
-      {
-         log (LOG_ERROR, "ERROR: crc mismatch in payload data: %08x vs %08x\n",
-              crc1, crc2);
+         log (LOG_ERROR, "ERR : corrupted message header\n");
+         skip_serial_pending(); /* skip payload, if any */
          write_nack();
-         closedown();
+         continue;
       }
+      /* FIXME: check sequence! */
+
+      /* payload, if any */
+
+      if (header->len)
+      {
+         ULONG crc1;
+         if (header->len > max_len)
+         {
+            log (LOG_ERROR, "ERR : buffer overflow (%d > %d)\n", 
+	         header->len, max_len);
+	    closedown();
+	 }
+         len_actual = read_serial(header->len, payload);
+         read_serial(4, (UBYTE *) &crc1);
+         crc2 = crc32(payload, header->len);
+         if ( (len_actual != header->len) || (crc1 != crc2) )
+         {
+            log (LOG_ERROR, "ERR : corrupted payload data (CRC: %08x vs %08x, len: %d vs %d)\n",
+                 crc1, crc2, len_actual, header->len);
+            write_nack();
+            continue;
+         }
+      }
+      break;
    }
    write_ack();
 }
 
-static void read_ack(void)
+static ULONG read_ack(void)
 {
-   ULONG ack;
+   ULONG ack = 0xDEADBEEF;
    read_serial(4, (UBYTE*) &ack);
-   if (ack != 0x506b4f6b /* PkOk */)
-   {
-      log (LOG_ERROR, "*** ERROR: read_ack failed!\n");
-      closedown();
-   }
+   return ack;
 }
 
 static void write_message(WORD msg, UBYTE *payload, int len)
@@ -298,26 +386,39 @@ static void write_message(WORD msg, UBYTE *payload, int len)
    static ULONG seq = 0;
    struct ax_header header;
 
-   header.msg = msg;
-   header.len = len;
-   header.seq = seq++;
-   header.crc = crc32((UBYTE*)&header, 8);
+   header.sync = 0;
+   header.msg  = msg;
+   header.len  = len;
+   header.seq  = seq++;
+   header.crc  = crc32((UBYTE*)&header, 8);
 
-   log (LOG_DEBUG, "WMSG: cmd=0x%04x len=%d seq=%d crc=%08x\n",
+   log (LOG_DEBUG, "WMSG: cmd=0x%02x len=%d seq=%d crc=%08x\n",
         header.msg, header.len, header.seq, header.crc);
 
-   write_serial(12, (UBYTE*) &header);
-
-   /* payload, if any */
-   if (len)
+   while (TRUE)
    {
-      ULONG crc1;
-      write_serial(len, payload);
-      crc1 = crc32(payload, len);
-      write_serial(4, (UBYTE*) &crc1);
-   }
+      ULONG ack;
 
-   read_ack();
+      write_serial(12, (UBYTE*) &header);
+
+      /* payload, if any */
+      if (len)
+      {
+         ULONG crc1;
+         write_serial(len, payload);
+         crc1 = crc32(payload, len);
+         write_serial(4, (UBYTE*) &crc1);
+      }
+
+      ack = read_ack();
+      if (ack != 0x506b4f6b /* PkOk */)
+      {
+         log (LOG_ERROR, "ERR : read_ack failed!\n");
+         skip_serial_pending();
+         continue;
+      }
+      break;
+   }
 }
 
 struct ax_recv {
@@ -502,7 +603,12 @@ int main(int argc, char **argv)
       closedown();
    }
 
-   io_serial->io_SerFlags = SERF_7WIRE | SERF_SHARED | SERF_XDISABLED;
+   io_serial->io_RBufLen  = BUFSIZE;
+   io_serial->io_ExtFlags = 0;
+   io_serial->io_ReadLen  = 8 ;
+   io_serial->io_WriteLen = 8 ;
+   io_serial->io_StopBits = 1 ;
+   io_serial->io_SerFlags = SERF_XDISABLED | SERF_7WIRE ;
    serial_open = !OpenDevice(device_name, 0, (struct IORequest*)io_serial, 0);
    if (!serial_open)
    {
@@ -513,6 +619,13 @@ int main(int argc, char **argv)
    wait_mask = SIGBREAKF_CTRL_C | 1L << mp_serial->mp_SigBit;
 
    setup_serial(baudrate);
+
+   timer_open = !OpenDevice("timer.device", UNIT_VBLANK, (struct IORequest*) &io_tr, 0);
+   if (!timer_open)
+   {
+      log (LOG_ERROR, "ERROR: timer.device did not open.\n");
+      closedown();
+   }
 
    while (TRUE)
    {
