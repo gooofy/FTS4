@@ -8,7 +8,7 @@ The aim for this project is to become fully AX compliant one day.
 
 Related projects:
 
-* lxamiga - Linux/Amiga File Transfer https://github.com/marksmanuk/lxamiga
+* lxamiga - Linux/Amiga File Transfer https://github.com/gooofy/lxamiga (this forked version does have error recovery / resync support)
 * fuse-aexplorer - A crude re-implementation of the Amiga Explorer protocol, for Linux/FUSE. https://github.com/norly/fuse-aexplorer
 
 ## Usage
