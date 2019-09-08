@@ -18,9 +18,10 @@
 static ULONG baudrate    = DEFAULT_BAUDRATE;
 static char *device_name = DEFAULT_DEVICE;
 
-#define BUFSIZE    1024
-#define READSIZE    512
-#define PATH_MAX    512
+#define BUFSIZE      1024
+#define READSIZE      512
+#define PATH_MAX      512
+#define DIRBUF_SIZE 16384
 
 #define SERIAL_TIMEOUT_SECS  1
 #define SERIAL_TIMEOUT_MIRCO 0
@@ -41,20 +42,63 @@ static int loglevel = LOG_INFO;
 #define MSG_EXISTS     0x0008
 #define MSG_ACK_CLOSE  0x000a
 
+#define MSG_DIR        0x0064
 #define MSG_FILE_SEND  0x0065
 #define MSG_FILE_RECV  0x0066
 #define MSG_FILE_CLOSE 0x006d
 
-static ULONG              wait_mask;
-static struct MsgPort    *mp_serial   = NULL;
-static struct IOExtSer   *io_serial   = NULL;
-static BOOL               serial_open = FALSE;
+struct ax_header 
+{
+   UBYTE sync;
+   UBYTE msg;
+   WORD  len;
+   ULONG seq;
+   ULONG crc;
+} ;
 
-static struct timerequest io_tr;
-static BOOL               timer_open  = FALSE;
+struct ax_recv 
+{
+   ULONG len;
+   ULONG file_size;
+   ULONG unknown;
+   ULONG attrs;
+   ULONG date;
+   ULONG time;
+   ULONG ctime;
+   UBYTE unknown2;
+};
 
-static struct FileHandle *io_file     = NULL;
+struct ax_dirent 
+{
+   ULONG len;    
+   ULONG size;
+   ULONG used;
+   WORD  type;
+   WORD  attrs; 
+   ULONG date;  
+   ULONG time;  
+   ULONG ctime; 
+   UBYTE type2; 
+};
 
+static ULONG                 wait_mask;
+static struct MsgPort       *mp_serial   = NULL;
+static struct IOExtSer      *io_serial   = NULL;
+static BOOL                  serial_open = FALSE;
+
+static struct timerequest    io_tr;
+static BOOL                  timer_open  = FALSE;
+
+static struct FileHandle    *io_file     = NULL;
+static struct ax_recv        recv;
+static char                  filename[PATH_MAX];
+static ULONG                 receiving=0, received;
+static ULONG                 sending=0, sent;
+static struct Lock          *lock = NULL;
+static struct FileInfoBlock *fib = NULL;
+static char                 *dirbuf = NULL;
+static ULONG                 dirbuf_todo = 0, dirbuf_done = 0;
+static BOOL                  dirbuf_sending = FALSE;
 
 static void log(int level, char *msg, ...)
 {
@@ -68,7 +112,6 @@ static void log(int level, char *msg, ...)
    va_end(argp);
    fflush(stdout);
 }
-
 
 static void closedown(void)
 {
@@ -97,6 +140,10 @@ static void closedown(void)
       log(LOG_DEBUG, "closedown: Close file\n");
       Close((BPTR) io_file);
    }
+   if (lock)
+   {
+      UnLock((BPTR) lock);
+   }
    if (timer_open)
    {
       log(LOG_DEBUG, "closedown: AbortIO timer\n");
@@ -105,6 +152,16 @@ static void closedown(void)
       WaitIO((struct IORequest*)&io_tr);
       log(LOG_DEBUG, "closedown: CloseDevice timer\n");
       CloseDevice((struct IORequest*)&io_tr);
+   }
+   if (fib)
+   {
+      log(LOG_DEBUG, "closedown: free fib\n");
+      FreeMem(fib, sizeof(struct FileInfoBlock));
+   }
+   if (dirbuf)
+   {
+      log(LOG_DEBUG, "closedown: free dirbuf\n");
+      FreeMem(dirbuf, DIRBUF_SIZE);
    }
    log(LOG_INFO, "goodbye.\n");
    exit();
@@ -311,14 +368,6 @@ static void write_nack(void)
    write_serial(4, (UBYTE*) "PkRs");
 }
 
-struct ax_header {
-   UBYTE sync;
-   UBYTE msg;
-   WORD  len;
-   ULONG seq;
-   ULONG crc;
-} ;
-
 static void read_message(struct ax_header *header, UBYTE *payload, int max_len)
 {
    while (TRUE)
@@ -421,22 +470,6 @@ static void write_message(WORD msg, UBYTE *payload, int len)
    }
 }
 
-struct ax_recv {
-   ULONG len;
-   ULONG file_size;
-   ULONG unknown;
-   ULONG attrs;
-   ULONG date;
-   ULONG time;
-   ULONG ctime;
-   UBYTE unknown2;
-};
-
-static struct ax_recv recv;
-static char           filename[PATH_MAX];
-static ULONG          receiving=0, received;
-static ULONG          sending=0, sent;
-
 static void msg_recv (UBYTE *recv_buf, WORD recv_len)
 {
    struct Lock     *file_lock;
@@ -515,8 +548,9 @@ static void msg_block (UBYTE *buf, WORD len)
 static void msg_eof (UBYTE *buf, WORD len)
 {
    log(LOG_DEBUG, "msg_eof\n");
-   receiving = 0;
-   sending   = 0;
+   receiving      = 0;
+   sending        = 0;
+   dirbuf_sending = FALSE;
 }
 
 static void msg_file_send (UBYTE *buf, WORD len)
@@ -574,9 +608,145 @@ static void msg_next_part (UBYTE *buf, WORD len)
    }
    else
    {
-      log(LOG_DEBUG, "SYNC\n");
+      if (dirbuf_sending)
+      {
+         ULONG l = dirbuf_todo > BUFSIZE-4 ? BUFSIZE-4 : dirbuf_todo;
+
+         log(LOG_DEBUG, "msg_next_part send dir %d\n", dirbuf_done);
+
+         if (l>0)
+         {
+            *((ULONG*)buf) = dirbuf_done;
+            CopyMem(dirbuf+dirbuf_done, (char*)buf+4, l);
+	    write_message(MSG_BLOCK, buf, l+4);
+            dirbuf_todo -= l;
+            dirbuf_done += l;
+         }
+         else
+         {
+	    write_message(MSG_EOF, NULL, 0);
+            dirbuf_todo=0;
+            dirbuf_done=0;
+            dirbuf_sending=FALSE;
+         }
+      }
+      else
+      {
+         log(LOG_DEBUG, "SYNC\n");
+      }
    }
 }
+
+static void msg_dir (UBYTE *buf, WORD len)
+{
+   strncpy (filename, (char *)buf, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_dir %s\n", filename);
+
+   if (lock)
+   {
+      UnLock((BPTR) lock);
+      lock = NULL;
+   }
+
+   lock = (struct Lock *) Lock(filename, ACCESS_READ);
+   if (lock)
+   {
+      if (Examine((BPTR)lock, (BPTR)fib))
+      {
+
+         log (LOG_DEBUG, "DIR %s size=%d, blocks=%d, dirtype=%d, type=%d\n", 
+              fib->fib_FileName,
+              fib->fib_Size,
+              fib->fib_NumBlocks,
+              fib->fib_DirEntryType,
+              fib->fib_EntryType);
+
+         if (fib->fib_DirEntryType>0)
+         {
+            char  *dirbuf_ptr  = dirbuf + 4;
+            ULONG  dirbuf_size = 0;
+            ULONG  dir_cnt     = 0;
+
+            dirbuf_todo = 4;
+
+            while (ExNext((BPTR)lock, (BPTR)fib))
+            {
+               ULONG entry_size, n, m;
+               struct ax_dirent *dirent;
+
+               n = strlen(fib->fib_FileName)+1;
+               m = strlen(fib->fib_Comment)+1;
+               entry_size = 29 + m + n;
+
+               log (LOG_DEBUG, "    %s size=%d, blocks=%d, dirtype=%d, type=%d, n=%d, m=%d, entry_size=%d\n", 
+                    fib->fib_FileName,
+                    fib->fib_Size,
+                    fib->fib_NumBlocks,
+                    fib->fib_DirEntryType,
+                    fib->fib_EntryType,
+                    n, m, entry_size);
+
+	       if ( (dirbuf_todo + entry_size) > DIRBUF_SIZE )
+               {
+                  log (LOG_ERROR, "ERR  *** dirbuf overflow!\n");
+                  break;
+               }
+               dirent = (struct ax_dirent *) dirbuf_ptr;
+               dirent->len   = entry_size ;
+               dirent->size  = fib->fib_Size ;
+               dirent->used  = fib->fib_Size ;
+               dirent->type  = fib->fib_DirEntryType > 0 ? 0x8000 : 0x0000 ;
+               dirent->attrs = fib->fib_Protection ;
+               dirent->date  = fib->fib_Date.ds_Days ;
+               dirent->time  = fib->fib_Date.ds_Minute ;
+               dirent->ctime = fib->fib_Date.ds_Minute ;
+               dirent->type2 = 0 ;
+
+               dirbuf_ptr += 29;
+               CopyMem(fib->fib_FileName, dirbuf_ptr, n);
+               dirbuf_ptr += n;
+               CopyMem(fib->fib_Comment, dirbuf_ptr, m);
+               dirbuf_ptr += m;
+
+	       dirbuf_todo = (LONG)dirbuf_ptr - (LONG)dirbuf;
+
+               dir_cnt += 1;
+            }
+
+            *((ULONG *) dirbuf) = dir_cnt;
+
+            UnLock((BPTR) lock);
+            lock = NULL;
+            sending = 0;
+            dirbuf_sending = TRUE;
+            dirbuf_done = 0;
+            write_message(MSG_MPARTH, (UBYTE*)&dirbuf_todo, 4); 
+         }
+         else
+         {
+            UnLock((BPTR) lock);
+            lock = NULL;
+            log (LOG_ERROR, "ERR  not a directory: %s\n", filename);
+            write_message(MSG_EOF, NULL, 0); 
+         }
+      }
+      else
+      {
+         UnLock((BPTR) lock);
+         lock = NULL;
+         log (LOG_ERROR, "ERR  examine() failed on %s\n", filename);
+         write_message(MSG_EOF, NULL, 0);
+      }
+   }
+   else
+   {
+      log (LOG_ERROR, "ERR  lock() failed on %s\n", filename);
+      write_message(MSG_EOF, NULL, 0);
+   }
+}
+
 int main(int argc, char **argv)
 {
    UBYTE buf_serial[BUFSIZE];
@@ -627,6 +797,20 @@ int main(int argc, char **argv)
       closedown();
    }
 
+   fib = (struct FileInfoBlock *)AllocMem(sizeof(struct FileInfoBlock), 0);
+   if (!fib)
+   {
+      log (LOG_ERROR, "ERROR: out of memory (fib).\n");
+      closedown();
+   }
+
+   dirbuf = AllocMem(DIRBUF_SIZE, 0);
+   if (!dirbuf)
+   {
+      log (LOG_ERROR, "ERROR: out of memory (dirbuf).\n");
+      closedown();
+   }
+
    while (TRUE)
    {
       read_message(&header, buf_serial, BUFSIZE);
@@ -666,6 +850,10 @@ int main(int argc, char **argv)
 
          case MSG_NEXT_PART:
             msg_next_part(buf_serial, header.len);
+            break;
+
+         case MSG_DIR:
+            msg_dir(buf_serial, header.len);
             break;
 
          default:
