@@ -720,12 +720,12 @@ static void msg_dir (UBYTE *buf, WORD len)
                   dirent->len   = entry_size ;
                   dirent->size  = fib->fib_Size ;
                   dirent->used  = fib->fib_Size ;
-                  dirent->type  = fib->fib_DirEntryType > 0 ? 0x0020 : 0x0000 ;
+                  dirent->type  = 0 ;
                   dirent->attrs = fib->fib_Protection ;
                   dirent->date  = fib->fib_Date.ds_Days ;
                   dirent->time  = fib->fib_Date.ds_Minute ;
                   dirent->ctime = fib->fib_Date.ds_Minute ;
-                  dirent->type2 = 0 ;
+                  dirent->type2 = fib->fib_DirEntryType > 0 ? 0x02 : 0x00 ;
 
                   dirbuf_ptr += 29;
                   CopyMem(fib->fib_FileName, dirbuf_ptr, n);
@@ -831,7 +831,7 @@ static void msg_dir (UBYTE *buf, WORD len)
                
                dirent->size  = info_data->id_NumBlocks * info_data->id_BytesPerBlock ;
                dirent->used  = info_data->id_NumBlocksUsed * info_data->id_BytesPerBlock ;
-               dirent->type  = 0x0000 ; /* FIXME 0x02 ?? */
+               dirent->type  = 0x0000 ;
                dirent->attrs = info_data->id_DiskState == ID_WRITE_PROTECTED ? 0x04 : 0x00 ;
                dirent->date  = devicelist->dl_VolumeDate.ds_Days ;
                dirent->time  = devicelist->dl_VolumeDate.ds_Minute ;
