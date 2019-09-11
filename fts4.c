@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+extern struct DosLibrary *DOSBase;
+
 #include "crc.h"
 
 #define VERSION "0.2.0"
@@ -99,6 +101,7 @@ static struct FileInfoBlock *fib = NULL;
 static char                 *dirbuf = NULL;
 static ULONG                 dirbuf_todo = 0, dirbuf_done = 0;
 static BOOL                  dirbuf_sending = FALSE;
+static struct InfoData      *info_data = NULL;
 
 static void log(int level, char *msg, ...)
 {
@@ -162,6 +165,11 @@ static void closedown(void)
    {
       log(LOG_DEBUG, "closedown: free dirbuf\n");
       FreeMem(dirbuf, DIRBUF_SIZE);
+   }
+   if (info_data)
+   {
+      log(LOG_DEBUG, "closedown: free info_data\n");
+      FreeMem(info_data, sizeof(struct InfoData));
    }
    log(LOG_INFO, "goodbye.\n");
    exit();
@@ -277,7 +285,7 @@ static int read_serial(int len, UBYTE *buf)
 
          if (CheckIO((struct IORequest*) &io_tr))
          {
-            log (LOG_DEBUG, "ERR : serial read timeout after %d bytes!\n", offset);
+            log (LOG_DEBUG2,"ERR : serial read timeout after %d bytes!\n", offset);
             WaitIO((struct IORequest*) &io_tr);
 
             AbortIO((struct IORequest*)io_serial);
@@ -637,6 +645,19 @@ static void msg_next_part (UBYTE *buf, WORD len)
    }
 }
 
+static void BSTR2C(BSTR *bstr, char *buf)
+{
+   LONG   counter = 0;
+   UBYTE *str = (UBYTE*) BADDR(bstr);
+   LONG   i;
+   
+   for (i = (LONG) str[0]; i--; counter++)
+   {
+      buf[counter] = str[counter+1];
+   }
+   buf[counter]=0;
+}
+
 static void msg_dir (UBYTE *buf, WORD len)
 {
    strncpy (filename, (char *)buf, PATH_MAX);
@@ -650,100 +671,196 @@ static void msg_dir (UBYTE *buf, WORD len)
       lock = NULL;
    }
 
-   lock = (struct Lock *) Lock(filename, ACCESS_READ);
-   if (lock)
+   if (strlen(filename)>0)
    {
-      if (Examine((BPTR)lock, (BPTR)fib))
+      lock = (struct Lock *) Lock(filename, ACCESS_READ);
+      if (lock)
       {
-
-         log (LOG_DEBUG, "DIR %s size=%d, blocks=%d, dirtype=%d, type=%d\n", 
-              fib->fib_FileName,
-              fib->fib_Size,
-              fib->fib_NumBlocks,
-              fib->fib_DirEntryType,
-              fib->fib_EntryType);
-
-         if (fib->fib_DirEntryType>0)
+         if (Examine((BPTR)lock, (BPTR)fib))
          {
-            char  *dirbuf_ptr  = dirbuf + 4;
-            ULONG  dirbuf_size = 0;
-            ULONG  dir_cnt     = 0;
 
-            dirbuf_todo = 4;
+            log (LOG_DEBUG, "DIR %s size=%d, blocks=%d, dirtype=%d, type=%d\n", 
+                 fib->fib_FileName,
+                 fib->fib_Size,
+                 fib->fib_NumBlocks,
+                 fib->fib_DirEntryType,
+                 fib->fib_EntryType);
 
-            while (ExNext((BPTR)lock, (BPTR)fib))
+            if (fib->fib_DirEntryType>0)
             {
-               ULONG entry_size, n, m;
-               struct ax_dirent *dirent;
+               char  *dirbuf_ptr  = dirbuf + 4;
+               ULONG  dirbuf_size = 0;
+               ULONG  dir_cnt     = 0;
 
-               n = strlen(fib->fib_FileName)+1;
-               m = strlen(fib->fib_Comment)+1;
-               entry_size = 29 + m + n;
+               dirbuf_todo = 4;
 
-               log (LOG_DEBUG, "    %s size=%d, blocks=%d, dirtype=%d, type=%d, n=%d, m=%d, entry_size=%d\n", 
-                    fib->fib_FileName,
-                    fib->fib_Size,
-                    fib->fib_NumBlocks,
-                    fib->fib_DirEntryType,
-                    fib->fib_EntryType,
-                    n, m, entry_size);
-
-	       if ( (dirbuf_todo + entry_size) > DIRBUF_SIZE )
+               while (ExNext((BPTR)lock, (BPTR)fib))
                {
-                  log (LOG_ERROR, "ERR  *** dirbuf overflow!\n");
-                  break;
+                  ULONG entry_size, n, m;
+                  struct ax_dirent *dirent;
+
+                  n = strlen(fib->fib_FileName)+1;
+                  m = strlen(fib->fib_Comment)+1;
+                  entry_size = 29 + m + n;
+
+                  log (LOG_DEBUG, "    %s size=%d, blocks=%d, dirtype=%d, type=%d, n=%d, m=%d, entry_size=%d\n", 
+                       fib->fib_FileName,
+                       fib->fib_Size,
+                       fib->fib_NumBlocks,
+                       fib->fib_DirEntryType,
+                       fib->fib_EntryType,
+                       n, m, entry_size);
+
+                  if ( (dirbuf_todo + entry_size) > DIRBUF_SIZE )
+                  {
+                     log (LOG_ERROR, "ERR  *** dirbuf overflow!\n");
+                     break;
+                  }
+                  dirent = (struct ax_dirent *) dirbuf_ptr;
+                  dirent->len   = entry_size ;
+                  dirent->size  = fib->fib_Size ;
+                  dirent->used  = fib->fib_Size ;
+                  dirent->type  = fib->fib_DirEntryType > 0 ? 0x0020 : 0x0000 ;
+                  dirent->attrs = fib->fib_Protection ;
+                  dirent->date  = fib->fib_Date.ds_Days ;
+                  dirent->time  = fib->fib_Date.ds_Minute ;
+                  dirent->ctime = fib->fib_Date.ds_Minute ;
+                  dirent->type2 = 0 ;
+
+                  dirbuf_ptr += 29;
+                  CopyMem(fib->fib_FileName, dirbuf_ptr, n);
+                  dirbuf_ptr += n;
+                  CopyMem(fib->fib_Comment, dirbuf_ptr, m);
+                  dirbuf_ptr += m;
+
+                  dirbuf_todo = (LONG)dirbuf_ptr - (LONG)dirbuf;
+
+                  dir_cnt += 1;
                }
-               dirent = (struct ax_dirent *) dirbuf_ptr;
-               dirent->len   = entry_size ;
-               dirent->size  = fib->fib_Size ;
-               dirent->used  = fib->fib_Size ;
-               dirent->type  = fib->fib_DirEntryType > 0 ? 0x8000 : 0x0000 ;
-               dirent->attrs = fib->fib_Protection ;
-               dirent->date  = fib->fib_Date.ds_Days ;
-               dirent->time  = fib->fib_Date.ds_Minute ;
-               dirent->ctime = fib->fib_Date.ds_Minute ;
-               dirent->type2 = 0 ;
 
-               dirbuf_ptr += 29;
-               CopyMem(fib->fib_FileName, dirbuf_ptr, n);
-               dirbuf_ptr += n;
-               CopyMem(fib->fib_Comment, dirbuf_ptr, m);
-               dirbuf_ptr += m;
+               *((ULONG *) dirbuf) = dir_cnt;
 
-	       dirbuf_todo = (LONG)dirbuf_ptr - (LONG)dirbuf;
-
-               dir_cnt += 1;
+               UnLock((BPTR) lock);
+               lock = NULL;
+               sending = 0;
+               dirbuf_sending = TRUE;
+               dirbuf_done = 0;
+               write_message(MSG_MPARTH, (UBYTE*)&dirbuf_todo, 4); 
             }
-
-            *((ULONG *) dirbuf) = dir_cnt;
-
-            UnLock((BPTR) lock);
-            lock = NULL;
-            sending = 0;
-            dirbuf_sending = TRUE;
-            dirbuf_done = 0;
-            write_message(MSG_MPARTH, (UBYTE*)&dirbuf_todo, 4); 
+            else
+            {
+               UnLock((BPTR) lock);
+               lock = NULL;
+               log (LOG_ERROR, "ERR  not a directory: %s\n", filename);
+               write_message(MSG_EOF, NULL, 0); 
+            }
          }
          else
          {
             UnLock((BPTR) lock);
             lock = NULL;
-            log (LOG_ERROR, "ERR  not a directory: %s\n", filename);
-            write_message(MSG_EOF, NULL, 0); 
+            log (LOG_ERROR, "ERR  examine() failed on %s\n", filename);
+            write_message(MSG_EOF, NULL, 0);
          }
       }
       else
       {
-         UnLock((BPTR) lock);
-         lock = NULL;
-         log (LOG_ERROR, "ERR  examine() failed on %s\n", filename);
+         log (LOG_ERROR, "ERR  lock() failed on %s\n", filename);
          write_message(MSG_EOF, NULL, 0);
       }
    }
-   else
+   else /* filename=="" -> list devices */
    {
-      log (LOG_ERROR, "ERR  lock() failed on %s\n", filename);
-      write_message(MSG_EOF, NULL, 0);
+      /* we have to extract these from internal dos.library
+          structures in order to stay kickstart 1.3 compatible  */
+  
+      struct RootNode   *rootnode;
+      struct DosInfo    *dosinfo;
+      struct DeviceList *devicelist;
+      struct FileLock   *filelock;
+   
+      char              *dirbuf_ptr  = dirbuf + 4;
+      ULONG              dirbuf_size = 0;
+      ULONG              dir_cnt     = 0;
+
+      Forbid();
+      
+      rootnode   = (struct RootNode*)   DOSBase->dl_Root;
+      dosinfo    = (struct DosInfo *)   BADDR(rootnode->rn_Info);
+      devicelist = (struct DeviceList*) BADDR(dosinfo->di_DevInfo);
+
+      dirbuf_todo = 4;
+
+      while (devicelist->dl_Next)
+      {
+         char              devname[257];
+         ULONG             entry_size, n, m;
+         struct ax_dirent *dirent;
+         BPTR              dev_lock = NULL;
+
+         if (devicelist->dl_Type != DLT_VOLUME) 
+         {
+            devicelist = (struct DeviceList *) BADDR(devicelist->dl_Next);
+            continue;
+         }
+
+         BSTR2C(devicelist->dl_Name, devname);
+         devname[strlen(devname)+1] = 0; 
+         devname[strlen(devname)]   = 58; /* append : */
+         
+         log (LOG_DEBUG, "    %s\n", devname);
+
+         dev_lock = Lock(devname, ACCESS_READ);
+         if (dev_lock)
+         {
+            n = strlen(devname)+1;
+            m = 1;
+            entry_size = 29 + m + n;
+
+            if ( (dirbuf_todo + entry_size) > DIRBUF_SIZE )
+            {
+               log (LOG_ERROR, "ERR  *** dirbuf overflow!\n");
+               UnLock(dev_lock);
+               break;
+            }
+
+            if (Info(dev_lock, info_data))
+            {
+               dirent = (struct ax_dirent *) dirbuf_ptr;
+               dirent->len   = entry_size ;
+               
+               dirent->size  = info_data->id_NumBlocks * info_data->id_BytesPerBlock ;
+               dirent->used  = info_data->id_NumBlocksUsed * info_data->id_BytesPerBlock ;
+               dirent->type  = 0x0000 ; /* FIXME 0x02 ?? */
+               dirent->attrs = info_data->id_DiskState == ID_WRITE_PROTECTED ? 0x04 : 0x00 ;
+               dirent->date  = devicelist->dl_VolumeDate.ds_Days ;
+               dirent->time  = devicelist->dl_VolumeDate.ds_Minute ;
+               dirent->ctime = devicelist->dl_VolumeDate.ds_Minute ; 
+               dirent->type2 = 0 ;
+               
+               dirbuf_ptr += 29;
+               CopyMem(devname, dirbuf_ptr, n);
+               dirbuf_ptr += n;
+               *dirbuf_ptr=0;
+               dirbuf_ptr += m;
+
+               dirbuf_todo = (LONG)dirbuf_ptr - (LONG)dirbuf;
+
+               dir_cnt += 1;
+            }
+            UnLock(dev_lock);
+         }
+         devicelist = (struct DeviceList *) BADDR(devicelist->dl_Next);
+      }
+      
+      Permit();
+
+      *((ULONG *) dirbuf) = dir_cnt;
+
+      sending = 0;
+      dirbuf_sending = TRUE;
+      dirbuf_done = 0;
+      write_message(MSG_MPARTH, (UBYTE*)&dirbuf_todo, 4); 
    }
 }
 
@@ -808,6 +925,13 @@ int main(int argc, char **argv)
    if (!dirbuf)
    {
       log (LOG_ERROR, "ERROR: out of memory (dirbuf).\n");
+      closedown();
+   }
+
+   info_data = AllocMem(sizeof(struct InfoData), 0);
+   if (!info_data)
+   {
+      log (LOG_ERROR, "ERROR: out of memory (info_data).\n");
       closedown();
    }
 
