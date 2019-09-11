@@ -8,6 +8,10 @@
 
 extern struct DosLibrary *DOSBase;
 
+/* V36 stuff */
+extern BOOL SetFileDate(const char *name, struct DateStamp *date);
+#pragma amicall(DOSBase,0x18c, SetFileDate(d1,d2));
+
 #include "crc.h"
 
 #define VERSION "0.2.0"
@@ -92,6 +96,7 @@ static struct timerequest    io_tr;
 static BOOL                  timer_open  = FALSE;
 
 static struct FileHandle    *io_file     = NULL;
+static ULONG                 io_flags=0;
 static struct ax_recv        recv;
 static char                  filename[PATH_MAX];
 static ULONG                 receiving=0, received;
@@ -507,18 +512,19 @@ static void msg_recv (UBYTE *recv_buf, WORD recv_len)
 
 static void msg_mparth (UBYTE *buf, WORD len)
 {
-   ULONG flags = *( ((ULONG*) buf) + 1 ); /* FIXME: implement */
+   /* FIXME: implement? lxamiga.pl puts a constant 0x000002000 here */
+   ULONG unk = *( ((ULONG*) buf) + 1 ); 
 
    receiving = *( (ULONG*) buf );
    received  = 0;
    sending   = 0;
 
-   log(LOG_DEBUG, "msg_mparth receiving=%d, flags=%0x08x\n", receiving, flags);
+   log(LOG_DEBUG, "msg_mparth receiving=%d, flags=%0x08x\n", receiving, io_flags);
 
    if (io_file)
       Close((BPTR)io_file);
 
-   /* FIXME: attributes, mode!, timestamps */
+   /* FIXME: timestamps */
    io_file = (struct FileHandle *) Open(filename, MODE_NEWFILE);
    if (!io_file)
    {
@@ -864,6 +870,23 @@ static void msg_dir (UBYTE *buf, WORD len)
    }
 }
 
+static void msg_close (UBYTE *buf, WORD len)
+{
+   if (io_file)
+      Close((BPTR) io_file);
+   SetProtection(filename, recv.attrs);
+   if (DOSBase->dl_lib.lib_Version >= 36)
+   {
+      struct DateStamp ds;
+      ds.ds_Days   = recv.date;
+      ds.ds_Minute = recv.time;
+      ds.ds_Tick   = 0;
+      SetFileDate(filename, &ds);
+   }
+   io_file = NULL;
+   write_message(MSG_ACK_CLOSE, NULL, 0);
+}
+
 int main(int argc, char **argv)
 {
    UBYTE buf_serial[BUFSIZE];
@@ -873,6 +896,9 @@ int main(int argc, char **argv)
    log (LOG_INFO, "FTS4 %s (C) 2019 by G. Bartsch\n\n", VERSION);
 
    parse_commandline(argc, argv);
+
+   log (LOG_INFO, "detected dos.library version %d rev %d\n",
+        DOSBase->dl_lib.lib_Version, DOSBase->dl_lib.lib_Revision);
 
    log (LOG_INFO, "Opening %s ...\n", device_name);
 
@@ -962,10 +988,7 @@ int main(int argc, char **argv)
             break;
 
          case MSG_FILE_CLOSE:
-            if (io_file)
-               Close((BPTR) io_file);
-            io_file = NULL;
-            write_message(MSG_ACK_CLOSE, NULL, 0);
+            msg_close(buf_serial, header.len);
             break;
 
          case MSG_FILE_SEND:
