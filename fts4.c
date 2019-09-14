@@ -39,19 +39,20 @@ static char *device_name = DEFAULT_DEVICE;
 
 static int loglevel = LOG_INFO;
 
-#define MSG_NEXT_PART  0x0000
-#define MSG_INIT       0x0002
-#define MSG_MPARTH     0x0003
-#define MSG_EOF        0x0004
-#define MSG_BLOCK      0x0005
+#define MSG_NEXT_PART   0x0000
+#define MSG_INIT        0x0002
+#define MSG_MPARTH      0x0003
+#define MSG_EOF         0x0004
+#define MSG_BLOCK       0x0005
  
-#define MSG_EXISTS     0x0008
-#define MSG_ACK_CLOSE  0x000a
+#define MSG_EXISTS      0x0008
+#define MSG_ACK_CLOSE   0x000a
 
-#define MSG_DIR        0x0064
-#define MSG_FILE_SEND  0x0065
-#define MSG_FILE_RECV  0x0066
-#define MSG_FILE_CLOSE 0x006d
+#define MSG_DIR         0x0064
+#define MSG_FILE_SEND   0x0065
+#define MSG_FILE_RECV   0x0066
+#define MSG_FILE_DELETE 0x0067
+#define MSG_FILE_CLOSE  0x006d
 
 struct ax_header 
 {
@@ -62,6 +63,9 @@ struct ax_header
    ULONG crc;
 } ;
 
+#define AX_FILE_TYPE_DIR  2
+#define AX_FILE_TYPE_FILE 3
+
 struct ax_recv 
 {
    ULONG len;
@@ -71,7 +75,7 @@ struct ax_recv
    ULONG date;
    ULONG time;
    ULONG ctime;
-   UBYTE unknown2;
+   UBYTE file_type;
 };
 
 struct ax_dirent 
@@ -107,6 +111,7 @@ static char                 *dirbuf = NULL;
 static ULONG                 dirbuf_todo = 0, dirbuf_done = 0;
 static BOOL                  dirbuf_sending = FALSE;
 static struct InfoData      *info_data = NULL;
+static char                  cmdbuf[BUFSIZE];
 
 static void log(int level, char *msg, ...)
 {
@@ -506,7 +511,31 @@ static void msg_recv (UBYTE *recv_buf, WORD recv_len)
    } 
    else
    {    
-      write_message (MSG_NEXT_PART, NULL, 0);
+      /* are we creating a directory here ? */
+
+      if (recv.file_type == AX_FILE_TYPE_DIR)
+      {
+         if (lock)
+         {
+            UnLock((BPTR) lock);
+            lock = NULL;
+         }
+         lock = (struct Lock *) CreateDir(filename);
+         if (lock)
+         {
+            log(LOG_DEBUG, "    makedir(%s) succeeded.\n", filename);
+            write_message (MSG_NEXT_PART, NULL, 0);
+         }
+         else
+         {
+            log(LOG_ERROR, "ERR makedir(%s) failed.\n", filename);
+            write_message (MSG_EXISTS, NULL, 0);
+         }
+      }
+      else
+      {
+         write_message (MSG_NEXT_PART, NULL, 0);
+      }
    }
 }
 
@@ -870,10 +899,34 @@ static void msg_dir (UBYTE *buf, WORD len)
    }
 }
 
+static void msg_file_delete (UBYTE *buf, WORD len)
+{
+   int l;
+
+   strncpy (filename, (char *)buf, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_file_delete %s\n", filename);
+
+   l = strlen(filename);
+   if ( (l>0) && (l<(BUFSIZE-30)) )
+   {
+      sprintf(cmdbuf, "delete \"%s\" ALL FORCE QUIET", filename); 
+      log(LOG_DEBUG, "    execute %s\n", cmdbuf);
+      Execute(cmdbuf,0,0);
+   }
+   write_message(MSG_NEXT_PART, NULL, 0);
+}
+
 static void msg_close (UBYTE *buf, WORD len)
 {
    if (io_file)
       Close((BPTR) io_file);
+   if (lock)
+   {
+      UnLock ((BPTR)lock);
+      lock = NULL;
+   } 
    SetProtection(filename, recv.attrs);
    if (DOSBase->dl_lib.lib_Version >= 36)
    {
@@ -993,6 +1046,10 @@ int main(int argc, char **argv)
 
          case MSG_FILE_SEND:
             msg_file_send(buf_serial, header.len);
+            break;
+
+         case MSG_FILE_DELETE:
+            msg_file_delete(buf_serial, header.len);
             break;
 
          case MSG_NEXT_PART:
