@@ -14,7 +14,7 @@ extern BOOL SetFileDate(const char *name, struct DateStamp *date);
 
 #include "crc.h"
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
 
 /* #define DEBUG_BYTES */
 
@@ -45,13 +45,14 @@ static int loglevel = LOG_INFO;
 #define MSG_EOF         0x0004
 #define MSG_BLOCK       0x0005
  
-#define MSG_EXISTS      0x0008
+#define MSG_IOERR      0x0008
 #define MSG_ACK_CLOSE   0x000a
 
 #define MSG_DIR         0x0064
 #define MSG_FILE_SEND   0x0065
 #define MSG_FILE_RECV   0x0066
 #define MSG_FILE_DELETE 0x0067
+#define MSG_FILE_RENAME 0x0068
 #define MSG_FILE_CLOSE  0x006d
 
 struct ax_header 
@@ -103,6 +104,7 @@ static struct FileHandle    *io_file     = NULL;
 static ULONG                 io_flags=0;
 static struct ax_recv        recv;
 static char                  filename[PATH_MAX];
+static char                  newname[PATH_MAX];
 static ULONG                 receiving=0, received;
 static ULONG                 sending=0, sent;
 static struct Lock          *lock = NULL;
@@ -506,7 +508,7 @@ static void msg_recv (UBYTE *recv_buf, WORD recv_len)
    file_lock = (struct Lock *) Lock (filename, ACCESS_READ);
    if (file_lock)
    {
-      write_message (MSG_EXISTS, NULL, 0);
+      write_message (MSG_IOERR, NULL, 0);
       UnLock ((BPTR)file_lock);
    } 
    else
@@ -529,7 +531,7 @@ static void msg_recv (UBYTE *recv_buf, WORD recv_len)
          else
          {
             log(LOG_ERROR, "ERR makedir(%s) failed.\n", filename);
-            write_message (MSG_EXISTS, NULL, 0);
+            write_message (MSG_IOERR, NULL, 0);
          }
       }
       else
@@ -553,13 +555,12 @@ static void msg_mparth (UBYTE *buf, WORD len)
    if (io_file)
       Close((BPTR)io_file);
 
-   /* FIXME: timestamps */
    io_file = (struct FileHandle *) Open(filename, MODE_NEWFILE);
    if (!io_file)
    {
       log(LOG_ERROR, "*** ERROR: couldn´t open file for writing: %s\n",
           filename);
-      write_message(MSG_EXISTS, NULL, 0);
+      write_message(MSG_IOERR, NULL, 0);
       return;
    }
 
@@ -611,7 +612,7 @@ static void msg_file_send (UBYTE *buf, WORD len)
    {
       log(LOG_ERROR, "*** ERROR: couldn´t open file for reading: %s\n",
           filename);
-      write_message(MSG_EXISTS, NULL, 0);
+      write_message(MSG_IOERR, NULL, 0);
       return;
    }
 
@@ -918,6 +919,60 @@ static void msg_file_delete (UBYTE *buf, WORD len)
    write_message(MSG_NEXT_PART, NULL, 0);
 }
 
+static void msg_file_rename (UBYTE *buf, WORD len)
+{
+   int              n;
+   BOOL             success;
+   struct FileLock *parent_lock, *old_lock;
+
+   strncpy (filename, (char *)buf, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+   n = strlen(filename);
+
+   strncpy (newname, (char *)(buf+n+1), PATH_MAX);
+   newname[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_file_rename %s -> %s\n", filename, newname);
+
+   if (lock)
+   {
+      UnLock((BPTR) lock);
+   }
+
+   lock = (struct Lock *) Lock(filename, ACCESS_READ);
+  
+   if (!lock)
+   {
+      log (LOG_ERROR, "ERR cannot lock %s\n", filename);
+      write_message(MSG_IOERR, NULL, 0);
+      return;
+   }
+
+   parent_lock = ParentDir((struct FileLock *) lock);
+
+   UnLock((BPTR) lock);
+   lock = NULL;
+
+   if (!parent_lock)
+   {
+      log (LOG_ERROR, "ERR failed to find parent lock od %s\n", filename);
+      write_message(MSG_IOERR, NULL, 0);
+      return;
+   }
+
+   old_lock = (struct FileLock *) CurrentDir(parent_lock);
+
+   success = Rename(filename, newname);
+
+   CurrentDir(old_lock);
+   UnLock((BPTR) parent_lock);
+
+   if (success)
+      write_message(MSG_NEXT_PART, NULL, 0);
+   else
+      write_message(MSG_IOERR, NULL, 0);
+}
+
 static void msg_close (UBYTE *buf, WORD len)
 {
    if (io_file)
@@ -1050,6 +1105,10 @@ int main(int argc, char **argv)
 
          case MSG_FILE_DELETE:
             msg_file_delete(buf_serial, header.len);
+            break;
+
+         case MSG_FILE_RENAME:
+            msg_file_rename(buf_serial, header.len);
             break;
 
          case MSG_NEXT_PART:
