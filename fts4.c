@@ -54,6 +54,7 @@ static int loglevel = LOG_INFO;
 #define MSG_FILE_DELETE 0x67
 #define MSG_FILE_RENAME 0x68
 #define MSG_FILE_MOVE   0x69
+#define MSG_FILE_COPY   0x6a
 #define MSG_FILE_CLOSE  0x6d
 
 struct ax_header 
@@ -984,8 +985,8 @@ static void msg_file_rename (UBYTE *buf, WORD len)
 
 static void msg_file_move (UBYTE *buf, WORD len)
 {
-   int              n;
-   BOOL             success;
+   int  n;
+   BOOL success;
 
    strncpy (filename, (char *)buf, PATH_MAX);
    filename[PATH_MAX-1] = 0;
@@ -1030,6 +1031,29 @@ static void msg_file_move (UBYTE *buf, WORD len)
             write_message(MSG_IOERR, NULL, 0);
       }
    }
+}
+
+static void msg_file_copy (UBYTE *buf, WORD len)
+{
+   int  n;
+   BOOL success;
+
+   strncpy (filename, (char *)buf, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+   n = strlen(filename);
+
+   strncpy (newname, (char *)(buf+n+1), PATH_MAX);
+   newname[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_file_copy %s -> %s\n", filename, newname);
+
+   sprintf(cmdbuf, "copy \"%s\" TO \"%s\"", filename, newname); 
+   log(LOG_DEBUG, "    execute %s\n", cmdbuf);
+   success = Execute(cmdbuf,0,0) && (IoErr()==0);
+   if (success)
+      write_message(MSG_NEXT_PART, NULL, 0);
+   else
+      write_message(MSG_IOERR, NULL, 0);
 }
 
 static void msg_close (UBYTE *buf, WORD len)
@@ -1174,6 +1198,10 @@ int main(int argc, char **argv)
 
          case MSG_FILE_MOVE:
             msg_file_move(buf_serial, header.len);
+            break;
+
+         case MSG_FILE_COPY:
+            msg_file_copy(buf_serial, header.len);
             break;
 
          case MSG_NEXT_PART:
