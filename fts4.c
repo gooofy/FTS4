@@ -14,7 +14,7 @@ extern BOOL SetFileDate(const char *name, struct DateStamp *date);
 
 #include "crc.h"
 
-#define VERSION "0.3.0"
+#define VERSION "0.3.1"
 
 /* #define DEBUG_BYTES */
 
@@ -39,21 +39,22 @@ static char *device_name = DEFAULT_DEVICE;
 
 static int loglevel = LOG_INFO;
 
-#define MSG_NEXT_PART   0x0000
-#define MSG_INIT        0x0002
-#define MSG_MPARTH      0x0003
-#define MSG_EOF         0x0004
-#define MSG_BLOCK       0x0005
+#define MSG_NEXT_PART   0x00
+#define MSG_INIT        0x02
+#define MSG_MPARTH      0x03
+#define MSG_EOF         0x04
+#define MSG_BLOCK       0x05
  
-#define MSG_IOERR      0x0008
-#define MSG_ACK_CLOSE   0x000a
+#define MSG_IOERR       0x08
+#define MSG_ACK_CLOSE   0x0a
 
-#define MSG_DIR         0x0064
-#define MSG_FILE_SEND   0x0065
-#define MSG_FILE_RECV   0x0066
-#define MSG_FILE_DELETE 0x0067
-#define MSG_FILE_RENAME 0x0068
-#define MSG_FILE_CLOSE  0x006d
+#define MSG_DIR         0x64
+#define MSG_FILE_SEND   0x65
+#define MSG_FILE_RECV   0x66
+#define MSG_FILE_DELETE 0x67
+#define MSG_FILE_RENAME 0x68
+#define MSG_FILE_MOVE   0x69
+#define MSG_FILE_CLOSE  0x6d
 
 struct ax_header 
 {
@@ -482,9 +483,12 @@ static void write_message(WORD msg, UBYTE *payload, int len)
       ack = read_ack();
       if (ack != 0x506b4f6b /* PkOk */)
       {
-         log (LOG_ERROR, "ERR : read_ack failed!\n");
-         skip_serial_pending();
-         continue;
+         log (LOG_ERROR, "ERR : read_ack failed! (got: 0x%08x)\n", ack);
+         if (ack == 0x506b5273) /* PkRs */
+         {
+            skip_serial_pending();
+            continue;
+         }
       }
       break;
    }
@@ -902,7 +906,8 @@ static void msg_dir (UBYTE *buf, WORD len)
 
 static void msg_file_delete (UBYTE *buf, WORD len)
 {
-   int l;
+   int    l;
+   BOOL   success = FALSE;
 
    strncpy (filename, (char *)buf, PATH_MAX);
    filename[PATH_MAX-1] = 0;
@@ -914,9 +919,13 @@ static void msg_file_delete (UBYTE *buf, WORD len)
    {
       sprintf(cmdbuf, "delete \"%s\" ALL FORCE QUIET", filename); 
       log(LOG_DEBUG, "    execute %s\n", cmdbuf);
-      Execute(cmdbuf,0,0);
+      success = Execute(cmdbuf,0,0);
    }
-   write_message(MSG_NEXT_PART, NULL, 0);
+
+   if (success)
+      write_message(MSG_NEXT_PART, NULL, 0);
+   else
+      write_message(MSG_IOERR, NULL, 0);
 }
 
 static void msg_file_rename (UBYTE *buf, WORD len)
@@ -973,25 +982,77 @@ static void msg_file_rename (UBYTE *buf, WORD len)
       write_message(MSG_IOERR, NULL, 0);
 }
 
+static void msg_file_move (UBYTE *buf, WORD len)
+{
+   int              n;
+   BOOL             success;
+
+   strncpy (filename, (char *)buf, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+   n = strlen(filename);
+
+   strncpy (newname, (char *)(buf+n+1), PATH_MAX);
+   newname[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_file_move %s -> %s\n", filename, newname);
+
+   /* this needs to work across devices.
+      We´ll try a simple rename first. If that fails,
+      we´ll user copy + remove                        */
+
+   sprintf(cmdbuf, "rename >NIL: \"%s\" TO \"%s\"", filename, newname); 
+   log(LOG_DEBUG, "    execute %s\n", cmdbuf);
+   success = Execute(cmdbuf,0,0) && (IoErr()==0);
+
+   if (success)
+   {
+      write_message(MSG_NEXT_PART, NULL, 0);
+   }
+   else
+   {
+      /* ok, copy+remove it is */
+      sprintf(cmdbuf, "copy \"%s\" TO \"%s\"", filename, newname); 
+      log(LOG_DEBUG, "    execute %s\n", cmdbuf);
+      success = Execute(cmdbuf,0,0) && (IoErr()==0);
+      if (!success)
+      {
+         log(LOG_ERROR, "ERR  failed %s\n", cmdbuf);
+         write_message(MSG_IOERR, NULL, 0);
+      }
+      else
+      {
+         sprintf(cmdbuf, "delete \"%s\" QUIET", filename); 
+         log(LOG_DEBUG, "    execute %s\n", cmdbuf);
+         success = Execute(cmdbuf,0,0);
+         if (success)
+            write_message(MSG_NEXT_PART, NULL, 0);
+         else
+            write_message(MSG_IOERR, NULL, 0);
+      }
+   }
+}
+
 static void msg_close (UBYTE *buf, WORD len)
 {
    if (io_file)
+   {
       Close((BPTR) io_file);
+      SetProtection(filename, recv.attrs);
+      if (DOSBase->dl_lib.lib_Version >= 36)
+      {
+         struct DateStamp ds;
+         ds.ds_Days   = recv.date;
+         ds.ds_Minute = recv.time;
+         ds.ds_Tick   = 0;
+         SetFileDate(filename, &ds);
+      }
+      io_file = NULL;
+   }
    if (lock)
    {
       UnLock ((BPTR)lock);
       lock = NULL;
    } 
-   SetProtection(filename, recv.attrs);
-   if (DOSBase->dl_lib.lib_Version >= 36)
-   {
-      struct DateStamp ds;
-      ds.ds_Days   = recv.date;
-      ds.ds_Minute = recv.time;
-      ds.ds_Tick   = 0;
-      SetFileDate(filename, &ds);
-   }
-   io_file = NULL;
    write_message(MSG_ACK_CLOSE, NULL, 0);
 }
 
@@ -1109,6 +1170,10 @@ int main(int argc, char **argv)
 
          case MSG_FILE_RENAME:
             msg_file_rename(buf_serial, header.len);
+            break;
+
+         case MSG_FILE_MOVE:
+            msg_file_move(buf_serial, header.len);
             break;
 
          case MSG_NEXT_PART:
