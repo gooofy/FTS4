@@ -1,3 +1,21 @@
+/*
+ * FTS4 - serial file transfer
+ *
+ * Copyright 2019 G. Bartsch
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <exec/exec.h>
 #include <functions.h>
 #include <devices/serial.h>
@@ -14,7 +32,7 @@ extern BOOL SetFileDate(const char *name, struct DateStamp *date);
 
 #include "crc.h"
 
-#define VERSION "0.3.1"
+#define VERSION "0.3.2"
 
 /* #define DEBUG_BYTES */
 
@@ -55,6 +73,7 @@ static int loglevel = LOG_INFO;
 #define MSG_FILE_RENAME 0x68
 #define MSG_FILE_MOVE   0x69
 #define MSG_FILE_COPY   0x6a
+#define MSG_FILE_ATTR   0x6b
 #define MSG_FILE_CLOSE  0x6d
 
 struct ax_header 
@@ -1056,6 +1075,33 @@ static void msg_file_copy (UBYTE *buf, WORD len)
       write_message(MSG_IOERR, NULL, 0);
 }
 
+static void msg_file_attr (UBYTE *buf, WORD len)
+{
+   int  n;
+   BOOL success = TRUE;
+   LONG attrs;
+
+   attrs = *((LONG *) buf);
+
+   strncpy (filename, (char *)buf+4, PATH_MAX);
+   filename[PATH_MAX-1] = 0;
+   n = strlen(filename);
+
+   strncpy (newname, (char *)(buf+n+5), PATH_MAX);
+   newname[PATH_MAX-1] = 0;
+
+   log(LOG_DEBUG, "msg_file_attrs %s (attr=0x%08x, comment=%s)\n", 
+       filename, attrs, newname);
+
+   success &= SetProtection(filename, attrs);
+   success &= SetComment(filename, newname);
+
+   if (success)
+      write_message(MSG_NEXT_PART, NULL, 0);
+   else
+      write_message(MSG_IOERR, NULL, 0);
+}
+
 static void msg_close (UBYTE *buf, WORD len)
 {
    if (io_file)
@@ -1202,6 +1248,10 @@ int main(int argc, char **argv)
 
          case MSG_FILE_COPY:
             msg_file_copy(buf_serial, header.len);
+            break;
+
+         case MSG_FILE_ATTR:
+            msg_file_attr(buf_serial, header.len);
             break;
 
          case MSG_NEXT_PART:
